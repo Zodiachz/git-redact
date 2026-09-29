@@ -1,0 +1,4 @@
+# git-redact settings for this repository (see README > Configuration)
+# test fixtures and README examples are fake on purpose
+ignore tests/
+ignore README.md

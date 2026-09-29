@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""git-redact: commit files with their secrets stripped out, get them back on checkout.
+
+A git clean/smudge filter. On `git add`, every secret found in a file is replaced by a
+placeholder (REDACTED-<id>) in what git stores; the file on disk is untouched. The real value is
+kept in a local vault outside the repository, so a checkout on this machine puts it back, and a
+clone anywhere else only ever sees the placeholder.
+
+    git redact init            set up the filter in the current repository
+    git redact check           fail if a secret is staged (pre-commit hook / CI)
+    git redact diff [paths]    show what would be redacted in the working tree
+    git redact rules           list the detection rules
+    git redact hook            install a pre-commit hook running `check`
+
+Stdlib only, Python 3.8+. https://github.com/Zodiachz/git-redact
+"""
+import fnmatch
+import hashlib
+import hmac
+import math
+import os
+import re
+import secrets as pysecrets
+import subprocess
+import sys
+
+__version__ = "1.0.0"
+
+PLACEHOLDER = "REDACTED"
+ID_LEN = 12
+PLACEHOLDER_RE = re.compile(r"REDACTED-([0-9a-f]{%d})" % ID_LEN)
+BINARY_SNIFF = 8000
+MAX_BYTES_DEFAULT = 20 * 1024 * 1024
+
+# ---------------------------------------------------------------------------------------- rules
+# Each rule matches a secret; the named group `s` (or the whole match) is what gets replaced.
+SECRET_KEY = (r"(?:secret|token|passw(?:or)?d|passwd|pwd|api[_-]?key|apikey|private[_-]?key|access[_-]?key"
+              r"|auth[_-]?key|signing[_-]?key|client[_-]?secret|credentials?|webhook[_-]?url|dsn)")
+
+BUILTIN = [
+    ("private-key", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----(?P<s>[\s\S]+?)-----END (?:[A-Z0-9]+ )*PRIVATE KEY", "PEM private key body"),
+    ("github-token", r"\b(?P<s>gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{80,255})\b", "GitHub tokens (classic and fine-grained)"),
+    ("gitlab-token", r"\b(?P<s>glpat-[A-Za-z0-9_-]{20,})", "GitLab personal access token"),
+    ("slack-token", r"\b(?P<s>xox[abposr]-[A-Za-z0-9-]{10,})", "Slack token"),
+    ("slack-webhook", r"hooks\.slack\.com/services/(?P<s>T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{20,})", "Slack incoming webhook"),
+    ("discord-webhook", r"discord(?:app)?\.com/api/webhooks/\d+/(?P<s>[A-Za-z0-9_-]{30,})", "Discord webhook token"),
+    ("discord-bot-token", r"\b(?P<s>[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,40})\b", "Discord bot token"),
+    ("telegram-bot-token", r"\b(?P<s>\d{8,10}:AA[A-Za-z0-9_-]{33})\b", "Telegram bot token"),
+    ("aws-access-key-id", r"\b(?P<s>(?:AKIA|ASIA)[A-Z0-9]{16})\b", "AWS access key id"),
+    ("aws-secret-key", r"(?i)aws_?secret_?access_?key[\"']?\s*[:=]\s*[\"']?(?P<s>[A-Za-z0-9/+=]{40})\b", "AWS secret access key"),
+    ("google-api-key", r"\b(?P<s>AIza[0-9A-Za-z_-]{35})", "Google API key"),
+    ("stripe-key", r"\b(?P<s>(?:sk|rk)_live_[A-Za-z0-9]{20,})", "Stripe live secret / restricted key"),
+    ("openai-key", r"\b(?P<s>sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,})", "OpenAI API key"),
+    ("anthropic-key", r"\b(?P<s>sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{80,})", "Anthropic API key"),
+    ("npm-token", r"\b(?P<s>npm_[A-Za-z0-9]{36})\b", "npm access token"),
+    ("pypi-token", r"\b(?P<s>pypi-AgE[A-Za-z0-9_-]{50,})", "PyPI API token"),
+    ("sendgrid-key", r"\b(?P<s>SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})\b", "SendGrid API key"),
+    ("jwt", r"\b(?P<s>eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})", "JSON Web Token"),
+    ("url-password", r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@\"'<>]*:(?P<s>[^\s@/\"'<>]{3,})@", "password inside a URL (postgres://user:pass@host)"),
+    ("secret-assignment", r"(?i)(?<![\w@/.-])[A-Za-z0-9_.-]*" + SECRET_KEY + r"[A-Za-z0-9_.-]*[\"']?\s*(?:[:=]|=>|:=)\s*(?P<q>[\"'`])(?P<s>[^\"'`\s]{8,})(?P=q)",
+     "quoted value assigned to a secret-looking name (API_KEY = \"...\", password: '...')"),
+    ("secret-line", r"(?im)^[ \t]*(?:export[ \t]+)?(?<![\w@/.-])[A-Za-z0-9_.-]*" + SECRET_KEY + r"[A-Za-z0-9_.-]*[ \t]*[:=][ \t]*(?P<s>[^\s\"'`#,;{}()\[\]]{8,})[ \t]*$",
+     "unquoted value on a KEY=value / key: value line"),
+]
+# Rules whose match must also look like a real value (not a placeholder, variable or plain word).
+CHECK_VALUE = {"url-password", "secret-assignment", "secret-line", "env-value"}
+PLACEHOLDERISH = re.compile(
+    r"^(?:REDACTED|\*+|x{4,}|X{4,}|\.{3,}|<.*>|\{\{.*\}\}|\$\{.*\}|\$[A-Za-z_]\w*|%[A-Za-z_]\w*%?|"
+    r".*(?:changeme|change[_-]?me|example|placeholder|your[_-]|dummy|fake|sample|todo|process\.env|os\.environ|getenv).*)$",
+    re.I)
+PLAIN_WORD = re.compile(r"^[a-z]+(?:[_.-][a-z]+)*$|^[a-z]+(?:[_.-][a-z0-9]+){2,}$")  # words, snake_case_names_v2
+ENV_SECRET_NAME = re.compile(r"(?i)" + SECRET_KEY + r"|salt|cookie|session|database_url|db_url|conn(?:ection)?_?str")
+
+
+def entropy(s):
+    if not s:
+        return 0.0
+    counts = {}
+    for c in s:
+        counts[c] = counts.get(c, 0) + 1
+    return -sum(n / len(s) * math.log2(n / len(s)) for n in counts.values())
+
+
+IDENT_CHAIN = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")  # config.apiKey, this.token
+LETTERS_ONLY = re.compile(r"^[A-Za-z_$]+$")                              # accessToken, hashedPassword
+
+
+SEMVER = re.compile(r"^[~^<>=v]*\d+(?:\.[\dx*]+){1,3}(?:[-+][\w.]+)?$")  # "^3.2.1", "1.x"
+URL = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+HEX_NUMBER = re.compile(r"^0[xX][0-9a-fA-F]{1,16}$")  # an address or a flag, not a key
+REGEXISH = re.compile(r"[\[\](){}\\^$|*?]")
+
+
+def random_part(value, min_len=20):
+    """True if some path/query piece is long and high-entropy (a token inside a URL)."""
+    return any(len(p) >= min_len and entropy(p) >= 3.5 for p in re.split(r"[/?&=#:@.]", value))
+
+
+def looks_real(value, rule=""):
+    if PLACEHOLDERISH.match(value) or PLAIN_WORD.match(value) or IDENT_CHAIN.match(value) or SEMVER.match(value):
+        return False
+    if len(set(value)) <= 2 or HEX_NUMBER.match(value):
+        return False
+    if LETTERS_ONLY.match(value):
+        # a bare word is a variable; a single-case word is a constant or a generated name
+        if rule == "secret-line" or value.isupper() or value.islower():
+            return False
+    if rule == "url-password" and REGEXISH.search(value):  # a regex like ://([^:]+):([^@]+)@
+        return False
+    if URL.match(value) and not random_part(value):  # an endpoint, not a webhook with a token
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------------------- git
+def git(*args, check=True, input=None):
+    r = subprocess.run(["git"] + list(args), input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and r.returncode != 0:
+        raise RuntimeError("git %s: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r.stdout.decode("utf-8", "surrogateescape")
+
+
+def git_config_all(key):
+    return [v for v in git("config", "--get-all", key, check=False).splitlines() if v.strip()]
+
+
+def git_config(key, default=None):
+    v = git("config", "--get", key, check=False).strip()
+    return v if v else default
+
+
+def repo_root():
+    try:
+        return git("rev-parse", "--show-toplevel").strip()
+    except RuntimeError:
+        return None
+
+
+# ---------------------------------------------------------------------------------------- vault
+class Vault:
+    """Secrets live outside the repository: <dir>/key (HMAC key) and <dir>/secrets/<id>."""
+
+    def __init__(self, path):
+        self.path = path
+        self.enabled = path is not None
+        self._key = None
+        self._cache = {}
+
+    @staticmethod
+    def default_path():
+        env = os.environ.get("GIT_REDACT_VAULT")
+        if env:
+            return None if env.lower() in ("0", "off", "false", "none") else env
+        cfg = git_config("redact.vault")
+        if cfg:
+            return None if cfg.lower() in ("0", "off", "false", "none") else os.path.expanduser(cfg)
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base, "git-redact")
+
+    def _private_write(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.%s.tmp" % (path, os.getpid(), pysecrets.token_hex(4))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic: concurrent filters never see half a file
+
+    def key(self):
+        if self._key is None:
+            kp = os.path.join(self.path, "key")
+            try:
+                with open(kp, "rb") as f:
+                    self._key = f.read()
+            except FileNotFoundError:
+                os.makedirs(self.path, mode=0o700, exist_ok=True)
+                self._private_write(kp, pysecrets.token_bytes(32))
+                with open(kp, "rb") as f:  # another process may have won the race: use its key
+                    self._key = f.read()
+        return self._key
+
+    def placeholder(self, secret):
+        if not self.enabled:
+            return PLACEHOLDER
+        sid = hmac.new(self.key(), secret.encode("utf-8", "surrogateescape"), hashlib.sha256).hexdigest()[:ID_LEN]
+        if sid not in self._cache:
+            sp = os.path.join(self.path, "secrets", sid)
+            if not os.path.exists(sp):
+                self._private_write(sp, secret.encode("utf-8", "surrogateescape"))
+            self._cache[sid] = secret
+        return "%s-%s" % (PLACEHOLDER, sid)
+
+    def lookup(self, sid):
+        if not self.enabled:
+            return None
+        if sid in self._cache:
+            return self._cache[sid]
+        try:
+            with open(os.path.join(self.path, "secrets", sid), "rb") as f:
+                v = f.read().decode("utf-8", "surrogateescape")
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        self._cache[sid] = v
+        return v
+
+
+# ---------------------------------------------------------------------------------------- engine
+class Rule:
+    def __init__(self, name, pattern, desc="", literal=None):
+        self.name = name
+        self.desc = desc
+        self.regex = re.compile(pattern) if literal is None else re.compile(re.escape(literal))
+        self.literal = literal is not None
+
+
+class Redactor:
+    def __init__(self, root=None, vault=None, load_config=True):
+        self.root = root
+        self.vault = vault if vault is not None else Vault(None)
+        self.rules = []
+        self.allow = set()
+        self.ignore = []  # path globs that check/diff skip (test fixtures, docs with fake keys)
+        self.max_bytes = MAX_BYTES_DEFAULT
+        disabled = set()
+        custom = []
+        literals = []
+        if load_config:
+            disabled |= set(v.strip() for v in git_config_all("redact.disable"))
+            mb = git_config("redact.maxBytes")
+            if mb and mb.isdigit():
+                self.max_bytes = int(mb)
+            custom, literals, dis2, allow, self.ignore = self._read_rules_file()
+            disabled |= dis2
+            self.allow |= allow
+            literals += self._env_values()
+            literals += self._secrets_file()
+        for name, pat, desc in BUILTIN:
+            if name not in disabled:
+                self.rules.append(Rule(name, pat, desc))
+        for name, pat in custom:
+            if name not in disabled:
+                self.rules.append(Rule(name, pat, "custom rule from .gitredact"))
+        seen = set()
+        for kind, value in sorted(literals, key=lambda kv: -len(kv[1])):  # longest first
+            if value not in seen and value not in self.allow:
+                seen.add(value)
+                self.rules.append(Rule(kind, None, "", literal=value))
+
+    # .gitredact in the repo root:
+    #   rule <name> <regex> | allow <literal> | disable <rule-name> | ignore <path glob>
+    def _read_rules_file(self):
+        custom, literals, disabled, allow, ignore = [], [], set(), set(), []
+        if not self.root:
+            return custom, literals, disabled, allow, ignore
+        path = os.path.join(self.root, ".gitredact")
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return custom, literals, disabled, allow, ignore
+        for n, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            try:
+                if parts[0] == "rule" and len(parts) == 3:
+                    re.compile(parts[2])
+                    custom.append((parts[1], parts[2]))
+                elif parts[0] == "allow" and len(parts) >= 2:
+                    allow.add(line.split(None, 1)[1])
+                elif parts[0] == "disable" and len(parts) == 2:
+                    disabled.add(parts[1])
+                elif parts[0] == "ignore" and len(parts) == 2:
+                    ignore.append(parts[1])
+                else:
+                    raise ValueError("expected: rule <name> <regex> | allow <value> | disable <rule> | ignore <glob>")
+            except (re.error, ValueError) as e:
+                raise SystemExit("git-redact: .gitredact line %d: %s" % (n, e))
+        return custom, literals, disabled, allow, ignore
+
+    def ignored(self, path):
+        path = path.replace("\\", "/")
+        return any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(path, g.rstrip("/") + "/*") for g in self.ignore)
+
+    # redact.envFile: values of secret-looking keys in these files are redacted wherever they appear
+    def _env_values(self):
+        out = []
+        for f in git_config_all("redact.envFile"):
+            path = f if os.path.isabs(f) else os.path.join(self.root or ".", f)
+            try:
+                with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+                    lines = fh.read().splitlines()
+            except FileNotFoundError:
+                continue
+            for line in lines:
+                m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*$", line)
+                if not m:
+                    continue
+                name, value = m.group(1), m.group(2)
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                if len(value) < 8 or not looks_real(value):
+                    continue
+                if ENV_SECRET_NAME.search(name) or (len(value) >= 16 and entropy(value) >= 3.5):
+                    out.append(("env-value", value))
+        return out
+
+    # redact.secretsFile: one literal secret per line (keep that file outside the repo)
+    def _secrets_file(self):
+        out = []
+        for f in git_config_all("redact.secretsFile"):
+            try:
+                with open(os.path.expanduser(f), encoding="utf-8", errors="surrogateescape") as fh:
+                    for line in fh.read().splitlines():
+                        v = line.strip()
+                        if len(v) >= 6 and not v.startswith("#"):
+                            out.append(("literal", v))
+            except FileNotFoundError:
+                continue
+        return out
+
+    def find(self, text):
+        """All secret spans as (start, end, rule), non-overlapping, earliest/longest first."""
+        spans = []
+        for rule in self.rules:
+            for m in rule.regex.finditer(text):
+                if rule.literal:
+                    s, e = m.span()
+                else:
+                    g = "s" if "s" in rule.regex.groupindex else 0
+                    s, e = m.span(g)
+                value = text[s:e]
+                if not value or value in self.allow or PLACEHOLDER_RE.fullmatch(value) or value == PLACEHOLDER:
+                    continue
+                if rule.name in CHECK_VALUE and not looks_real(value, rule.name):
+                    continue
+                spans.append((s, e, rule.name))
+        spans.sort(key=lambda t: (t[0], -(t[1] - t[0])))
+        out, last = [], -1
+        for s, e, name in spans:
+            if s >= last:
+                out.append((s, e, name))
+                last = e
+        return out
+
+    def clean_text(self, text):
+        spans = self.find(text)
+        if not spans:
+            return text, spans
+        parts, pos = [], 0
+        for s, e, _ in spans:
+            parts.append(text[pos:s])
+            parts.append(self.vault.placeholder(text[s:e]))
+            pos = e
+        parts.append(text[pos:])
+        return "".join(parts), spans
+
+    def smudge_text(self, text):
+        def put_back(m):
+            v = self.vault.lookup(m.group(1))
+            return v if v is not None else m.group(0)
+        return PLACEHOLDER_RE.sub(put_back, text)
+
+    def _skip(self, data):
+        return len(data) > self.max_bytes or b"\0" in data[:BINARY_SNIFF]
+
+    def clean(self, data):
+        if self._skip(data):
+            return data
+        return self.clean_text(data.decode("utf-8", "surrogateescape"))[0].encode("utf-8", "surrogateescape")
+
+    def smudge(self, data):
+        if self._skip(data) or b"REDACTED-" not in data:
+            return data
+        return self.smudge_text(data.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+
+
+# ---------------------------------------------------------------------------------------- filter protocol
+# git's long-running filter protocol (gitattributes(5), "Long Running Filter Process"): one
+# process for the whole checkout/add instead of one per file.
+MAX_PKT = 65516
+
+
+class PktIO:
+    def __init__(self, rd, wr):
+        self.rd, self.wr = rd, wr
+
+    def _read_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.rd.read(n - len(buf))
+            if not chunk:
+                raise EOFError
+            buf += chunk
+        return buf
+
+    def read(self):
+        n = int(self._read_exact(4), 16)
+        return None if n == 0 else self._read_exact(n - 4)
+
+    def read_list(self):
+        out = []
+        while True:
+            p = self.read()
+            if p is None:
+                return out
+            out.append(p)
+
+    def read_text_list(self):
+        return [p.decode().rstrip("\n") for p in self.read_list()]
+
+    def write(self, data):
+        self.wr.write(b"%04x" % (len(data) + 4) + data)
+
+    def write_text(self, *lines):
+        for l in lines:
+            self.write((l + "\n").encode())
+
+    def flush(self):
+        self.wr.write(b"0000")
+        self.wr.flush()
+
+
+def run_process(redactor):
+    io = PktIO(sys.stdin.buffer, sys.stdout.buffer)
+    hello = io.read_text_list()
+    if "git-filter-client" not in hello or "version=2" not in hello:
+        raise SystemExit("git-redact: unexpected filter handshake")
+    io.write_text("git-filter-server", "version=2")
+    io.flush()
+    caps = io.read_text_list()
+    offer = [c for c in ("capability=clean", "capability=smudge") if c in caps]
+    io.write_text(*offer)
+    io.flush()
+    while True:
+        try:
+            headers = io.read_text_list()
+        except EOFError:
+            return
+        meta = dict(h.split("=", 1) for h in headers if "=" in h)
+        content = b"".join(io.read_list())
+        try:
+            if meta.get("command") == "clean":
+                out = redactor.clean(content)
+            elif meta.get("command") == "smudge":
+                out = redactor.smudge(content)
+            else:
+                raise ValueError("unsupported command " + meta.get("command", "?"))
+        except Exception as e:  # tell git, keep serving the next files
+            sys.stderr.write("git-redact: %s: %s\n" % (meta.get("pathname", "?"), e))
+            io.write_text("status=error")
+            io.flush()
+            continue
+        io.write_text("status=success")
+        io.flush()
+        for i in range(0, len(out), MAX_PKT):
+            io.write(out[i:i + MAX_PKT])
+        io.flush()
+        io.flush()  # empty list: status unchanged
+
+
+# ---------------------------------------------------------------------------------------- commands
+def mask(value):
+    v = value.replace("\n", " ")
+    return (v[:4] + "...(%d chars)" % len(value)) if len(v) > 6 else "..."  # ASCII: any console encoding
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def self_command():
+    """How git should call this script: absolute interpreter + script path, quoted for sh."""
+    def q(s):
+        return "'" + s.replace("'", "'\\''") + "'"
+    return "%s %s" % (q(sys.executable.replace("\\", "/")), q(os.path.abspath(__file__).replace("\\", "/")))
+
+
+def cmd_init(args):
+    root = repo_root()
+    if not root:
+        raise SystemExit("git-redact: not inside a git repository")
+    patterns = [a for a in args if not a.startswith("-")] or ["*"]
+    me = self_command()
+    git("config", "filter.redact.process", me + " process")
+    git("config", "filter.redact.clean", me + " clean")
+    git("config", "filter.redact.smudge", me + " smudge")
+    git("config", "filter.redact.required", "true")
+    if "--no-vault" in args:
+        git("config", "redact.vault", "off")
+    ga = os.path.join(root, ".gitattributes")
+    existing = open(ga, encoding="utf-8").read() if os.path.exists(ga) else ""
+    have = set(l.split()[0] for l in existing.splitlines() if "filter=redact" in l and l.split())
+    add = [p for p in patterns if p not in have]
+    if add:
+        with open(ga, "a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            if not have:
+                f.write("# git-redact: secrets are stripped from these files when they are committed\n")
+            for p in add:
+                f.write("%s filter=redact\n" % p)
+    vault = Vault.default_path()
+    print("git-redact is set up in %s" % root)
+    print("  filter : %s" % me)
+    print("  files  : %s  (.gitattributes)" % " ".join(patterns))
+    print("  vault  : %s" % (vault or "off (placeholders cannot be restored on checkout)"))
+    print("\nNext:")
+    print("  git redact diff                 # preview what will be redacted")
+    print("  git add --renormalize . && git add .gitattributes")
+    print("  git commit -m 'Redact secrets'")
+    print("\nFiles committed before today still contain their secrets in history: rotate those secrets.")
+
+
+def cmd_clean(args):
+    data = sys.stdin.buffer.read()
+    sys.stdout.buffer.write(make_redactor().clean(data))
+
+
+def cmd_smudge(args):
+    data = sys.stdin.buffer.read()
+    sys.stdout.buffer.write(make_redactor().smudge(data))
+
+
+def make_redactor(load_config=True):
+    root = repo_root() if load_config else None
+    return Redactor(root=root, vault=Vault(Vault.default_path()), load_config=load_config)
+
+
+def iter_blobs(rev):
+    """(path, bytes) for every blob in the index (rev=None) or in a commit."""
+    if rev:
+        listing = git("ls-tree", "-r", "-z", rev).split("\0")
+        entries = []
+        for e in listing:
+            if not e:
+                continue
+            meta, path = e.split("\t", 1)
+            mode, typ, sha = meta.split()
+            if typ == "blob" and not mode.startswith("12"):  # skip symlinks
+                entries.append((path, sha))
+    else:
+        entries = []
+        for e in git("ls-files", "-s", "-z").split("\0"):
+            if not e:
+                continue
+            meta, path = e.split("\t", 1)
+            mode, sha, _stage = meta.split()
+            if not mode.startswith("12") and not mode.startswith("16"):  # symlinks, submodules
+                entries.append((path, sha))
+    if not entries:
+        return
+    p = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    for path, sha in entries:
+        p.stdin.write(sha.encode() + b"\n")
+        p.stdin.flush()
+        header = p.stdout.readline().split()
+        size = int(header[2])
+        data = p.stdout.read(size)
+        p.stdout.read(1)
+        yield path, data
+    p.stdin.close()
+    p.wait()
+
+
+def cmd_check(args):
+    rev = None
+    if "--rev" in args:
+        i = args.index("--rev")
+        if i + 1 >= len(args):
+            raise SystemExit("git-redact: --rev needs a commit")
+        rev = args[i + 1]
+    red = Redactor(root=repo_root(), vault=Vault(None))
+    hits = 0
+    files = 0
+    for path, data in iter_blobs(rev):
+        if red._skip(data) or red.ignored(path):
+            continue
+        text = data.decode("utf-8", "surrogateescape")
+        spans = red.find(text)
+        if spans:
+            files += 1
+        for s, e, name in spans:
+            hits += 1
+            print("%s:%d: %s %s" % (path, line_of(text, s), name, mask(text[s:e])))
+    where = "commit %s" % rev if rev else "the index (staged files)"
+    if hits:
+        print("\ngit-redact: %d secret(s) in %d file(s) in %s." % (hits, files, where), file=sys.stderr)
+        print("Cover these files with `filter=redact` in .gitattributes (git redact init <pattern>), then\n"
+              "git add --renormalize <files>. Allow a false positive with `allow <value>` in .gitredact.", file=sys.stderr)
+        return 1
+    print("git-redact: no secrets in %s." % where)
+    return 0
+
+
+def cmd_diff(args):
+    root = repo_root()
+    red = Redactor(root=root, vault=Vault(None))
+    paths = [a for a in args if not a.startswith("-")]
+    if not paths:
+        paths = [p for p in git("ls-files", "-z").split("\0") if p]
+        paths += [p for p in git("ls-files", "-z", "--others", "--exclude-standard").split("\0") if p]
+    total = 0
+    for p in paths:
+        full = os.path.join(root or ".", p) if not os.path.isabs(p) else p
+        if not os.path.isfile(full) or red.ignored(p):
+            continue
+        with open(full, "rb") as f:
+            data = f.read()
+        if red._skip(data):
+            continue
+        text = data.decode("utf-8", "surrogateescape")
+        covered = git("check-attr", "filter", "--", p, check=False).strip().endswith(": redact")
+        for s, e, name in red.find(text):
+            total += 1
+            print("%s:%d: %-20s %s%s" % (p, line_of(text, s), name, mask(text[s:e]), "" if covered else "   (NOT covered by filter=redact)"))
+    print("\n%d secret(s) found." % total if total else "No secrets found.")
+    return 0
+
+
+def cmd_rules(args):
+    red = Redactor(root=repo_root(), vault=Vault(None))
+    width = max(len(r.name) for r in red.rules) if red.rules else 10
+    lits = {}
+    for r in red.rules:
+        if r.literal:
+            lits[r.name] = lits.get(r.name, 0) + 1
+        else:
+            print("%-*s  %s" % (width, r.name, r.desc))
+    for name, n in lits.items():
+        print("%-*s  %d literal value(s) from %s" % (width, name, n, "redact.envFile" if name == "env-value" else "redact.secretsFile"))
+    return 0
+
+
+def cmd_hook(args):
+    root = repo_root()
+    if not root:
+        raise SystemExit("git-redact: not inside a git repository")
+    hooks = git("rev-parse", "--git-path", "hooks").strip()
+    hooks = hooks if os.path.isabs(hooks) else os.path.join(root, hooks)
+    os.makedirs(hooks, exist_ok=True)
+    path = os.path.join(hooks, "pre-commit")
+    if os.path.exists(path) and "git-redact" not in open(path, encoding="utf-8", errors="replace").read():
+        raise SystemExit("git-redact: %s already exists; add this line to it:\n  %s check" % (path, self_command()))
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\n# git-redact: refuse to commit a staged secret\nexec %s check\n" % self_command())
+    os.chmod(path, 0o755)
+    print("pre-commit hook installed: %s" % path)
+    return 0
+
+
+USAGE = __doc__.split("\n\n", 1)[1]
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE.rstrip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd in ("-v", "--version", "version"):
+        print("git-redact " + __version__)
+        return 0
+    if cmd == "process":
+        run_process(make_redactor())
+        return 0
+    table = {"init": cmd_init, "clean": cmd_clean, "smudge": cmd_smudge, "check": cmd_check, "diff": cmd_diff,
+             "rules": cmd_rules, "hook": cmd_hook}
+    if cmd not in table:
+        print("git-redact: unknown command %r (see git redact --help)" % cmd, file=sys.stderr)
+        return 2
+    return table[cmd](args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
